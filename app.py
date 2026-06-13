@@ -6,7 +6,9 @@
 口径: 销售=资金明细成交金额(CNY,半托管已折供货价); 退款=售中+售后; 平台费=佣金+交易服务费+
 联盟佣金+金币营销+cashback+营销技术/智投/新商孵化−各退回; 采购=领星cg_price×数量(仅净成交>0行);
 物流=物流账单按订单内数量分摊(仅自发货单)。毛利=成交−退款−平台费−采购−物流。
-⚠️ 待结算行平台费暂0(放款滞后),月底重跑补全 → cron 设次月16号(多数已放款)。
+回款=已放款金额(放款金额列,真实收口径A,随放款进度增长)。
+待结算行平台费暂0(放款滞后)→ 按已结算行费率估算(任意日期算都准,不必等16号放款);
+月底幂等重跑会用真实放款值收口(误差归零)。可配合运营提前导数→提前cron。
 env: FEISHU_APP_ID/FEISHU_APP_SECRET(聪哥1号) / LX_APP_ID/LX_SECRET(领星) / AUTH_TOKEN
 """
 import os, io, json, time, hashlib, base64, datetime, tempfile, warnings
@@ -154,6 +156,7 @@ def parse_capital(path, store):
                          "qty": num(g(r, "商品数量")), "cj": num(g(r, "成交金额")),
                          "refund": num(g(r, "售中退款金额")) + num(g(r, "售后退款金额")),
                          "fee": sum(num(g(r, c)) for c in FEE) - sum(num(g(r, c)) for c in BACK),
+                         "payout": num(g(r, "放款金额")),  # 已放款金额=真回款(实收口径)
                          "st": str(g(r, "结算状态") or "").strip()})
     except Exception as e:
         print("parse_capital", path, e)
@@ -186,28 +189,36 @@ def compute(files, cg):
     erp = lambda s: SKU_MAP.get(s, s)
     oq = defaultdict(float)
     for x in recs: oq[x["on"]] += x["qty"]
-    tot = [0.0] * 7  # qty,cj,refund,fee,cg,wl,maoli
-    miss = defaultdict(float); pend = 0; washed = 0; agg = defaultdict(lambda: [0.0] * 7)
+    # 已结算发货行的平台费率 → 估算待结算行平台费(待结算行fee=0,放款后才结算→任意日期算都准, 不用等16号)
+    s_fee = sum(x["fee"] for x in recs if x["st"] == "已结算" and (x["cj"] - x["refund"]) > 0.5)
+    s_cj = sum(x["cj"] for x in recs if x["st"] == "已结算" and (x["cj"] - x["refund"]) > 0.5)
+    fee_rate = (s_fee / s_cj) if s_cj else 0.0
+    tot = [0.0] * 8  # qty,cj,refund,fee,cg,wl,maoli,payout(回款)
+    miss = defaultdict(float); pend = 0; washed = 0; fee_est = 0.0; agg = defaultdict(lambda: [0.0] * 8)
     for x in recs:
         es = erp(x["sku"]); net = x["cj"] - x["refund"]; shipped = net > 0.5
         cgc = (cg.get(es, 0) * x["qty"]) if shipped else 0
         if shipped and es and es not in cg: miss[f"{x['sku']}->{es}"] += x["cj"]
         w = (wl.get(x["on"], 0) * (x["qty"] / oq[x["on"]] if oq[x["on"]] else 0)) if shipped else 0
-        if x["st"] != "已结算": pend += 1
+        fee = x["fee"]
+        if x["st"] != "已结算":
+            pend += 1
+            if shipped and fee == 0:           # 待结算行平台费暂0 → 按已结算费率估算
+                fee = x["cj"] * fee_rate; fee_est += fee
         if not shipped: washed += 1
-        ml = x["cj"] - x["refund"] - x["fee"] - cgc - w
-        vals = [x["qty"], x["cj"], x["refund"], x["fee"], cgc, w, ml]
+        ml = x["cj"] - x["refund"] - fee - cgc - w
+        vals = [x["qty"], x["cj"], x["refund"], fee, cgc, w, ml, x["payout"]]
         a = agg[(x["store"], es)]
         for i, v in enumerate(vals): a[i] += v; tot[i] += v
     return {"rows": len(recs), "pending": pend, "washed": washed, "logi_orders": len(wl),
-            "tot": tot, "miss": dict(miss), "agg": agg}
+            "tot": tot, "miss": dict(miss), "agg": agg, "fee_rate": fee_rate, "fee_est": fee_est}
 
 
 # ===== 灌全渠道总表 (速卖通 summary 行, 幂等) =====
 def upsert_overview(T, month, r):
     tot = r["tot"]
     net_sales = tot[1] - tot[2]                # 净成交
-    maoli = tot[6]
+    maoli = tot[6]; payout = tot[7]            # payout=放款金额=真回款(实收口径A)
     fields = {
         "月份": month, "渠道大类": "跨境电商", "平台": "速卖通",
         "店铺": "FUNLAB+LinYuvo(2店)",
@@ -218,6 +229,8 @@ def upsert_overview(T, month, r):
         "物流费RMB": round(tot[5], 2),
         "全额毛利RMB": round(maoli, 2),
         "毛利率": round(maoli / net_sales, 4) if net_sales else 0,
+        "回款RMB": round(payout, 2),            # 真回款=已放款金额(随放款进度增长)
+        "回款率": round(payout / net_sales, 4) if net_sales else 0,
     }
     found = None
     for rec in getall(T, FIN_APP, OVERVIEW_TBL):
@@ -265,10 +278,10 @@ def do_recompute(month):
     lines = [
         f"🟡 [FIN·P2] 速卖通毛利报表 · {month}",
         f"总成交¥{tot[1]:.0f} | 净成交¥{net:.0f} | 退款¥{tot[2]:.0f} | 平台费¥{tot[3]:.0f} | 采购¥{tot[4]:.0f} | 物流¥{tot[5]:.0f}",
-        f"净毛利 ¥{tot[6]:.0f} ({tot[6]/net*100 if net else 0:.1f}%净成交) · 已{act}总表(跨境/速卖通)",
+        f"净毛利 ¥{tot[6]:.0f} ({tot[6]/net*100 if net else 0:.1f}%净成交) | 回款(已放款)¥{tot[7]:.0f} · 已{act}总表(跨境/速卖通)",
         f"Top: {toptxt}",
     ]
-    if r["pending"]: lines.append(f"⚠️ {r['pending']}行待结算(平台费暂未补全,月底重跑更准)")
+    if r["pending"]: lines.append(f"ℹ️ {r['pending']}行待结算,平台费已按已结算费率{r['fee_rate']*100:.1f}%估算¥{r['fee_est']:.0f}(任意日期算都准,无需等月底)")
     if r["miss"]: lines.append(f"⚠️ 领星缺cg: {r['miss']}")
     summary = "\n".join(lines)
     send_msg(T, FRANKIE, summary)
