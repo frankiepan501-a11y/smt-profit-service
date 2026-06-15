@@ -32,7 +32,8 @@ OVERVIEW_TBL = "tbltFK8vwdcrlfBa"           # 全渠道销售总览
 FRANKIE = "ou_629ce01f4bc31de078e10fcb038dbf78"
 ZWJ = "ou_274ee5199a763b7ec97980cd54e3fecb"  # 赵伟俊(速卖通负责人)
 
-SKU_MAP = {"FF01-4": "FF01-1", "FF01-7": "FF01B-01", "FF01-5": "FF01A-05", "KS42-2-2": "KS42-2"}
+# SKU_MAP: 速卖通后台SKU → 领星ERP编码(赵伟俊2026-06-15确认: FF01-4波纹=FF01A-4; 余3个原映射对)
+SKU_MAP = {"FF01-4": "FF01A-4", "FF01-7": "FF01B-01", "FF01-5": "FF01A-05", "KS42-2-2": "KS42-2"}
 FEE = ["佣金", "交易服务费", "联盟佣金", "金币营销费", "cashback", "营销技术服务费", "营销智投服务费", "新商孵化服务费"]
 BACK = [c + "退回" for c in FEE]
 app = FastAPI()
